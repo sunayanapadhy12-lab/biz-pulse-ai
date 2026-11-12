@@ -681,13 +681,15 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'Internal Server Error', message: err?.message });
 });
 
-if (process.env.NODE_ENV !== 'test') {
+if (
+  process.env.NODE_ENV !== 'test' &&
+  process.env.VERCEL !== '1'
+) {
   app.listen(PORT, () => {
     console.log(`[Biz Pulse AI Backend] Server running on http://localhost:${PORT}`);
     console.log(`[Biz Pulse AI Backend] PayPal Environment: ${process.env.PAYPAL_ENVIRONMENT || 'sandbox'}`);
   });
 }
-
 export { app };
 export default app;
 
