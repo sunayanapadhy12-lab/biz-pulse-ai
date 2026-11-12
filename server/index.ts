@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import 'dotenv/config';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
@@ -8,6 +9,24 @@ import {
   verifyWebhookSignature,
 } from './paypalClient.ts';
 import type { WebhookHeaders } from './paypalClient.ts';
+import {
+  getInvoice,
+  getAllInvoices,
+  saveInvoice,
+  saveInvoicesBatch,
+  getAllTransactions,
+  saveTransaction,
+  getTransactionByReference,
+  savePayPalOrder,
+  getPayPalOrder,
+  markWebhookProcessed,
+  isWebhookProcessed,
+  settleInvoicePaymentAtomic,
+} from './database.ts';
+import type { InvoiceRecord, TransactionRecord } from './types.ts';
+
+// Re-export types so external callers have access to data contracts
+export type { InvoiceRecord, TransactionRecord } from './types.ts';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -17,232 +36,168 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================================
-// In-Memory Repository (Modular & replaceable with Supabase / SQL DB)
+// Default Seed Invoices & Transactions (Mirrors initial business ledger)
 // ============================================================================
 
-export interface InvoiceRecord {
-  id: string;
-  invoiceNumber: string;
-  customer: string;
-  customerEmail: string;
-  issueDate: string;
-  dueDate: string;
-  amount: number;
-  currency?: string;
-  status: 'paid' | 'pending' | 'overdue' | 'draft';
-  paypalOrderId?: string;
-  paypalCaptureId?: string;
-  items?: Array<{ id: string; description: string; quantity: number; unitPrice: number }>;
-}
+export const defaultSeedInvoices: InvoiceRecord[] = [
+  {
+    id: 'inv-1',
+    invoiceNumber: 'INV-2026-088',
+    customer: 'Vanguard Media Group',
+    customerEmail: 'billing@vanguardmedia.co',
+    issueDate: '2026-11-01',
+    dueDate: '2026-11-15',
+    amount: 2850.0,
+    currency: 'USD',
+    status: 'pending',
+    items: [
+      { id: '1', description: 'Monthly Executive Coffee Bar Service', quantity: 1, unitPrice: 1850 },
+      { id: '2', description: 'VIP Pastry Box Assortment (Weekly)', quantity: 4, unitPrice: 250 },
+    ],
+  },
+  {
+    id: 'inv-2',
+    invoiceNumber: 'INV-2026-087',
+    customer: 'BioGenix Labs Inc.',
+    customerEmail: 'ap@biogenixlabs.org',
+    issueDate: '2026-10-22',
+    dueDate: '2026-11-05',
+    amount: 3200.0,
+    currency: 'USD',
+    status: 'overdue',
+    items: [
+      { id: '1', description: 'Symposium Breakfast & Lunch Service', quantity: 80, unitPrice: 40 },
+    ],
+  },
+  {
+    id: 'inv-3',
+    invoiceNumber: 'INV-2026-086',
+    customer: 'Crestline Architecture',
+    customerEmail: 'finance@crestline.arch',
+    issueDate: '2026-10-28',
+    dueDate: '2026-11-12',
+    amount: 1970.0,
+    currency: 'USD',
+    status: 'pending',
+    items: [
+      { id: '1', description: 'Artisan Bakery Delivery - Batch 4', quantity: 1, unitPrice: 1970 },
+    ],
+  },
+  {
+    id: 'inv-4',
+    invoiceNumber: 'INV-2026-085',
+    customer: 'Summit Ventures Capital',
+    customerEmail: 'accounts@summitvc.io',
+    issueDate: '2026-10-15',
+    dueDate: '2026-10-30',
+    amount: 4500.0,
+    currency: 'USD',
+    status: 'paid',
+  },
+  {
+    id: 'inv-5',
+    invoiceNumber: 'INV-2026-084',
+    customer: 'NorthStar Coworking Hub',
+    customerEmail: 'ops@northstarhub.com',
+    issueDate: '2026-10-10',
+    dueDate: '2026-10-24',
+    amount: 1620.0,
+    currency: 'USD',
+    status: 'overdue',
+  },
+  {
+    id: 'inv-6',
+    invoiceNumber: 'INV-2026-083',
+    customer: 'Pinnacle Law Partners',
+    customerEmail: 'finance@pinnaclelaw.com',
+    issueDate: '2026-10-05',
+    dueDate: '2026-10-20',
+    amount: 3760.0,
+    currency: 'USD',
+    status: 'paid',
+  },
+];
 
-export interface TransactionRecord {
-  id: string;
-  name: string;
-  category: string;
-  date: string;
-  amount: number;
-  type: 'income' | 'expense';
-  status: 'completed' | 'pending' | 'failed';
-  reference: string;
-  paymentMethod: string;
-}
+export const defaultSeedTransactions: TransactionRecord[] = [
+  {
+    id: 'tx-1',
+    name: 'Apex Design Studio - Monthly Catering',
+    category: 'Corporate Sales',
+    date: 'Today, 10:45 AM',
+    amount: 3450.0,
+    type: 'income',
+    status: 'completed',
+    reference: 'TXN-90214',
+    paymentMethod: 'Bank Transfer (ACH)',
+    currency: 'USD',
+    provider: 'PayPal Sandbox',
+  },
+];
 
-// Seed initial invoices mirroring business ledger
-const invoicesStore: Map<string, InvoiceRecord> = new Map([
-  [
-    'inv-1',
-    {
-      id: 'inv-1',
-      invoiceNumber: 'INV-2026-088',
-      customer: 'Vanguard Media Group',
-      customerEmail: 'billing@vanguardmedia.co',
-      issueDate: '2026-11-01',
-      dueDate: '2026-11-15',
-      amount: 2850.0,
-      status: 'pending',
-      items: [
-        { id: '1', description: 'Monthly Executive Coffee Bar Service', quantity: 1, unitPrice: 1850 },
-        { id: '2', description: 'VIP Pastry Box Assortment (Weekly)', quantity: 4, unitPrice: 250 },
-      ],
-    },
-  ],
-  [
-    'inv-2',
-    {
-      id: 'inv-2',
-      invoiceNumber: 'INV-2026-087',
-      customer: 'BioGenix Labs Inc.',
-      customerEmail: 'ap@biogenixlabs.org',
-      issueDate: '2026-10-22',
-      dueDate: '2026-11-05',
-      amount: 3200.0,
-      status: 'overdue',
-      items: [
-        { id: '1', description: 'Symposium Breakfast & Lunch Service', quantity: 80, unitPrice: 40 },
-      ],
-    },
-  ],
-  [
-    'inv-3',
-    {
-      id: 'inv-3',
-      invoiceNumber: 'INV-2026-086',
-      customer: 'Crestline Architecture',
-      customerEmail: 'finance@crestline.arch',
-      issueDate: '2026-10-28',
-      dueDate: '2026-11-12',
-      amount: 1970.0,
-      status: 'pending',
-      items: [
-        { id: '1', description: 'Artisan Bakery Delivery - Batch 4', quantity: 1, unitPrice: 1970 },
-      ],
-    },
-  ],
-  [
-    'inv-4',
-    {
-      id: 'inv-4',
-      invoiceNumber: 'INV-2026-085',
-      customer: 'Summit Ventures Capital',
-      customerEmail: 'accounts@summitvc.io',
-      issueDate: '2026-10-15',
-      dueDate: '2026-10-30',
-      amount: 4500.0,
-      status: 'paid',
-    },
-  ],
-  [
-    'inv-5',
-    {
-      id: 'inv-5',
-      invoiceNumber: 'INV-2026-084',
-      customer: 'NorthStar Coworking Hub',
-      customerEmail: 'ops@northstarhub.com',
-      issueDate: '2026-10-10',
-      dueDate: '2026-10-24',
-      amount: 1620.0,
-      status: 'overdue',
-    },
-  ],
-  [
-    'inv-6',
-    {
-      id: 'inv-6',
-      invoiceNumber: 'INV-2026-083',
-      customer: 'Pinnacle Law Partners',
-      customerEmail: 'finance@pinnaclelaw.com',
-      issueDate: '2026-10-05',
-      dueDate: '2026-10-20',
-      amount: 3760.0,
-      status: 'paid',
-    },
-  ],
-]);
-
-// Ledger transactions store
-const transactionsStore: Map<string, TransactionRecord> = new Map([
-  [
-    'tx-1',
-    {
-      id: 'tx-1',
-      name: 'Apex Design Studio - Monthly Catering',
-      category: 'Corporate Sales',
-      date: 'Today, 10:45 AM',
-      amount: 3450.0,
-      type: 'income',
-      status: 'completed',
-      reference: 'TXN-90214',
-      paymentMethod: 'Bank Transfer (ACH)',
-    },
-  ],
-]);
-
-// Anti-replay and idempotency tracking
-const processedCaptures = new Set<string>();
-const processedWebhookEventIds = new Set<string>();
-const orderToInvoiceMap = new Map<string, { invoiceId: string; amount: number }>();
-
-// ============================================================================
-// Helper: Mark invoice paid and record credited transaction
-// ============================================================================
-
-function settleInvoice(
-  invoice: InvoiceRecord,
-  captureId: string,
-  orderId?: string
-): { invoice: InvoiceRecord; transaction: TransactionRecord } {
-  invoice.status = 'paid';
-  invoice.paypalCaptureId = captureId;
-  if (orderId) invoice.paypalOrderId = orderId;
-  invoicesStore.set(invoice.id, invoice);
-
-  // Check if ledger transaction already exists for this capture
-  let transaction: TransactionRecord | undefined;
-  for (const tx of transactionsStore.values()) {
-    if (tx.reference === captureId) {
-      transaction = tx;
-      break;
+/**
+ * Ensures initial default data exists in Supabase on first run
+ */
+async function ensureInitialData(): Promise<void> {
+  try {
+    const existingInvoices = await getAllInvoices().catch(() => []);
+    if (!existingInvoices || existingInvoices.length === 0) {
+      console.log('[Supabase Init] Seeding initial business ledger invoices...');
+      await saveInvoicesBatch(defaultSeedInvoices);
     }
+
+    const existingTransactions = await getAllTransactions().catch(() => []);
+    if (!existingTransactions || existingTransactions.length === 0) {
+      console.log('[Supabase Init] Seeding initial ledger transaction...');
+      await saveTransaction(defaultSeedTransactions[0]);
+    }
+  } catch (err) {
+    console.warn('[Supabase Init Notice] Could not auto-seed default data:', err);
   }
-
-  if (!transaction) {
-    const formattedDate = new Intl.DateTimeFormat('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: 'numeric',
-      hour12: true,
-    }).format(new Date());
-
-    transaction = {
-      id: `tx-pp-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      name: `${invoice.customer} - #${invoice.invoiceNumber} Settlement`,
-      category: 'Corporate Sales',
-      date: `Today, ${formattedDate}`,
-      amount: invoice.amount,
-      type: 'income',
-      status: 'completed',
-      reference: captureId,
-      paymentMethod: 'PayPal Sandbox',
-    };
-    transactionsStore.set(transaction.id, transaction);
-  }
-
-  return { invoice, transaction };
 }
 
 // ============================================================================
-// API Endpoints
+// API Endpoints Router (Mounted on both /api and / for Vercel compatibility)
 // ============================================================================
+
+const apiRouter = express.Router();
 
 /**
  * Health check
  */
-app.get('/api/health', (_req: Request, res: Response) => {
+apiRouter.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     service: 'Biz Pulse AI PayPal Gateway',
     environment: process.env.PAYPAL_ENVIRONMENT || 'sandbox',
     configured: Boolean(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET),
+    database: 'supabase',
     timestamp: new Date().toISOString(),
   });
 });
 
 /**
- * Get all invoices
+ * Get all invoices from Supabase
  */
-app.get('/api/invoices', (_req: Request, res: Response) => {
-  res.json(Array.from(invoicesStore.values()));
+apiRouter.get('/invoices', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    let invoices = await getAllInvoices();
+    if (!invoices || invoices.length === 0) {
+      await ensureInitialData();
+      invoices = await getAllInvoices();
+    }
+    res.json(invoices);
+  } catch (error: any) {
+    console.error('[Get Invoices Error]', error);
+    res.status(500).json({ error: 'Failed to fetch invoices', message: error?.message });
+  }
 });
 
 /**
  * POST /api/invoices
- * Registers newly created invoice in the backend repository.
- * Validates ID, invoice number, positive amount, currency ('USD'), and status.
+ * Registers newly created invoice in the Supabase repository.
  * Rejects duplicate invoice IDs to preserve data integrity.
  */
-app.post('/api/invoices', (req: Request, res: Response): void => {
+apiRouter.post('/invoices', async (req: Request, res: Response): Promise<void> => {
   try {
     const {
       id,
@@ -266,7 +221,8 @@ app.post('/api/invoices', (req: Request, res: Response): void => {
     const trimmedId = id.trim();
 
     // Prevent duplicate invoice IDs
-    if (invoicesStore.has(trimmedId)) {
+    const existing = await getInvoice(trimmedId);
+    if (existing) {
       console.warn(`[Invoice Duplicate] Attempted duplicate registration for invoice ID "${trimmedId}"`);
       res.status(409).json({
         error: 'Duplicate invoice',
@@ -312,17 +268,27 @@ app.post('/api/invoices', (req: Request, res: Response): void => {
     const newInvoice: InvoiceRecord = {
       id: trimmedId,
       invoiceNumber: invoiceNumber.trim(),
-      customer: (customer && typeof customer === 'string' ? customer.trim() : 'Valued Customer'),
-      customerEmail: (customerEmail && typeof customerEmail === 'string' ? customerEmail.trim() : 'billing@clientcorp.com'),
-      issueDate: (issueDate && typeof issueDate === 'string' ? issueDate.trim() : new Date().toISOString().split('T')[0]),
-      dueDate: (dueDate && typeof dueDate === 'string' ? dueDate.trim() : new Date().toISOString().split('T')[0]),
+      customer: customer && typeof customer === 'string' ? customer.trim() : 'Valued Customer',
+      customerEmail:
+        customerEmail && typeof customerEmail === 'string'
+          ? customerEmail.trim()
+          : 'billing@clientcorp.com',
+      issueDate:
+        issueDate && typeof issueDate === 'string'
+          ? issueDate.trim()
+          : new Date().toISOString().split('T')[0],
+      dueDate:
+        dueDate && typeof dueDate === 'string'
+          ? dueDate.trim()
+          : new Date().toISOString().split('T')[0],
       amount: Math.round(parsedAmount * 100) / 100,
       currency: 'USD',
       status: invoiceStatus as InvoiceRecord['status'],
       items: Array.isArray(items) ? items : undefined,
+      metadata: {},
     };
 
-    invoicesStore.set(trimmedId, newInvoice);
+    await saveInvoice(newInvoice);
 
     console.log(
       `[Invoice Register] Registered invoice ${newInvoice.id} (#${newInvoice.invoiceNumber}) for "${newInvoice.customer}" - Amount: $${newInvoice.amount.toFixed(2)} USD, Status: ${newInvoice.status}`
@@ -330,7 +296,7 @@ app.post('/api/invoices', (req: Request, res: Response): void => {
 
     res.status(201).json({
       success: true,
-      message: 'Invoice registered successfully in backend repository',
+      message: 'Invoice registered successfully in Supabase repository',
       invoice: newInvoice,
     });
   } catch (error: any) {
@@ -341,81 +307,52 @@ app.post('/api/invoices', (req: Request, res: Response): void => {
 
 /**
  * POST /api/invoices/sync
- * Safe synchronization mechanism for existing local / demo invoices.
- * Ensures the backend receives the exact invoice ID and amount before create-order is called.
- * Critical safety: Never overwrites an already-paid invoice or an invoice with an existing PayPal capture.
+ * Safe synchronization mechanism for initial local / demo invoices.
+ * Ensures Supabase receives exact invoice IDs and amounts before create-order is called.
+ * Critical safety: Never overwrites an already-paid invoice or one with an existing PayPal capture.
  */
-app.post('/api/invoices/sync', (req: Request, res: Response): void => {
+apiRouter.post('/invoices/sync', async (req: Request, res: Response): Promise<void> => {
   try {
-    const rawList = req.body?.invoices || (req.body?.invoice ? [req.body.invoice] : (Array.isArray(req.body) ? req.body : []));
+    const rawList =
+      req.body?.invoices ||
+      (req.body?.invoice ? [req.body.invoice] : Array.isArray(req.body) ? req.body : []);
 
     if (!Array.isArray(rawList) || rawList.length === 0) {
       res.status(400).json({ error: 'No invoices provided for synchronization' });
       return;
     }
 
-    let created = 0;
-    let updated = 0;
-    let skipped = 0;
-
+    const normalizedList: InvoiceRecord[] = [];
     for (const raw of rawList) {
       if (!raw || typeof raw.id !== 'string' || !raw.id.trim()) continue;
+      const parsedAmount = typeof raw.amount === 'number' ? raw.amount : parseFloat(raw.amount);
+      if (isNaN(parsedAmount) || parsedAmount <= 0) continue;
 
-      const id = raw.id.trim();
-      const existing = invoicesStore.get(id);
-
-      // SAFETY: Do not overwrite an already-paid invoice or an invoice with an existing PayPal capture
-      if (existing) {
-        if (existing.status === 'paid' || existing.paypalCaptureId) {
-          skipped++;
-          console.log(`[Invoice Sync] Skipped overwrite of paid/captured invoice ${id} (#${existing.invoiceNumber})`);
-          continue;
-        }
-
-        // Update mutable details safely while keeping status / amounts validated
-        const parsedAmount = typeof raw.amount === 'number' ? raw.amount : parseFloat(raw.amount);
-        if (!isNaN(parsedAmount) && parsedAmount > 0) {
-          existing.amount = Math.round(parsedAmount * 100) / 100;
-        }
-        if (raw.customer) existing.customer = String(raw.customer).trim();
-        if (raw.customerEmail) existing.customerEmail = String(raw.customerEmail).trim();
-        if (raw.dueDate) existing.dueDate = String(raw.dueDate).trim();
-        if (raw.status && ['pending', 'overdue', 'draft'].includes(raw.status)) {
-          existing.status = raw.status;
-        }
-        if (Array.isArray(raw.items)) existing.items = raw.items;
-
-        updated++;
-      } else {
-        // Register missing invoice into repository
-        const parsedAmount = typeof raw.amount === 'number' ? raw.amount : parseFloat(raw.amount);
-        if (isNaN(parsedAmount) || parsedAmount <= 0) continue;
-
-        const newRecord: InvoiceRecord = {
-          id,
-          invoiceNumber: raw.invoiceNumber ? String(raw.invoiceNumber).trim() : `INV-${id}`,
-          customer: raw.customer ? String(raw.customer).trim() : 'Valued Customer',
-          customerEmail: raw.customerEmail ? String(raw.customerEmail).trim() : 'billing@clientcorp.com',
-          issueDate: raw.issueDate ? String(raw.issueDate).trim() : new Date().toISOString().split('T')[0],
-          dueDate: raw.dueDate ? String(raw.dueDate).trim() : new Date().toISOString().split('T')[0],
-          amount: Math.round(parsedAmount * 100) / 100,
-          currency: 'USD',
-          status: raw.status && ['paid', 'pending', 'overdue', 'draft'].includes(raw.status) ? raw.status : 'pending',
-          items: Array.isArray(raw.items) ? raw.items : undefined,
-        };
-
-        invoicesStore.set(id, newRecord);
-        created++;
-        console.log(`[Invoice Sync] Registered missing invoice ${id} (#${newRecord.invoiceNumber}) - Amount: $${newRecord.amount.toFixed(2)} USD`);
-      }
+      normalizedList.push({
+        id: raw.id.trim(),
+        invoiceNumber: raw.invoiceNumber ? String(raw.invoiceNumber).trim() : `INV-${raw.id.trim()}`,
+        customer: raw.customer ? String(raw.customer).trim() : 'Valued Customer',
+        customerEmail: raw.customerEmail ? String(raw.customerEmail).trim() : 'billing@clientcorp.com',
+        issueDate: raw.issueDate ? String(raw.issueDate).trim() : new Date().toISOString().split('T')[0],
+        dueDate: raw.dueDate ? String(raw.dueDate).trim() : new Date().toISOString().split('T')[0],
+        amount: Math.round(parsedAmount * 100) / 100,
+        currency: 'USD',
+        status:
+          raw.status && ['paid', 'pending', 'overdue', 'draft'].includes(raw.status)
+            ? raw.status
+            : 'pending',
+        items: Array.isArray(raw.items) ? raw.items : undefined,
+        metadata: {},
+      });
     }
+
+    const batchResult = await saveInvoicesBatch(normalizedList);
+    const allInvoices = await getAllInvoices();
 
     res.json({
       success: true,
-      created,
-      updated,
-      skipped,
-      totalInvoices: invoicesStore.size,
+      ...batchResult,
+      totalInvoices: allInvoices.length,
     });
   } catch (error: any) {
     console.error('[Invoice Sync Error]', error);
@@ -424,18 +361,84 @@ app.post('/api/invoices/sync', (req: Request, res: Response): void => {
 });
 
 /**
- * Get all ledger transactions
+ * Get all ledger transactions from Supabase
  */
-app.get('/api/transactions', (_req: Request, res: Response) => {
-  res.json(Array.from(transactionsStore.values()));
+apiRouter.get('/transactions', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    let transactions = await getAllTransactions();
+    if (!transactions || transactions.length === 0) {
+      await ensureInitialData();
+      transactions = await getAllTransactions();
+    }
+    res.json(transactions);
+  } catch (error: any) {
+    console.error('[Get Transactions Error]', error);
+    res.status(500).json({ error: 'Failed to fetch transactions', message: error?.message });
+  }
+});
+
+/**
+ * POST /api/transactions
+ * Persists a manually created or newly logged transaction in Supabase
+ */
+apiRouter.post('/transactions', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id, name, category, date, amount, type, status, reference, paymentMethod, invoiceId } =
+      req.body;
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      res.status(400).json({ error: 'Valid transaction name is required' });
+      return;
+    }
+
+    const parsedAmount = typeof amount === 'number' ? amount : parseFloat(amount);
+    if (isNaN(parsedAmount) || !isFinite(parsedAmount) || parsedAmount <= 0) {
+      res.status(400).json({ error: 'Transaction amount must be a positive number' });
+      return;
+    }
+
+    const txId = id && typeof id === 'string' && id.trim() ? id.trim() : `tx-${Date.now()}`;
+    const newTx: TransactionRecord = {
+      id: txId,
+      invoiceId: invoiceId || undefined,
+      name: name.trim(),
+      category: category && typeof category === 'string' ? category.trim() : 'Corporate Sales',
+      date: date && typeof date === 'string' ? date.trim() : 'Today, Just now',
+      amount: Math.round(parsedAmount * 100) / 100,
+      type: type === 'expense' ? 'expense' : 'income',
+      status: status === 'pending' || status === 'failed' ? status : 'completed',
+      reference:
+        reference && typeof reference === 'string'
+          ? reference.trim()
+          : `TXN-${Math.floor(10000 + Math.random() * 90000)}`,
+      paymentMethod:
+        paymentMethod && typeof paymentMethod === 'string'
+          ? paymentMethod.trim()
+          : 'Bank Transfer (ACH)',
+      currency: 'USD',
+      provider: 'PayPal Sandbox',
+      metadata: {},
+    };
+
+    await saveTransaction(newTx);
+
+    res.status(201).json({
+      success: true,
+      message: 'Transaction saved to Supabase general ledger',
+      transaction: newTx,
+    });
+  } catch (error: any) {
+    console.error('[Save Transaction Error]', error);
+    res.status(500).json({ error: 'Failed to save transaction', message: error?.message });
+  }
 });
 
 /**
  * POST /api/paypal/create-order
- * Validates invoice from backend repository and creates PayPal Sandbox order.
+ * Validates invoice from Supabase repository and creates PayPal Sandbox order.
  * Server strictly dictates order amount and currency ('USD') to prevent frontend tampering.
  */
-app.post('/api/paypal/create-order', async (req: Request, res: Response): Promise<void> => {
+apiRouter.post('/paypal/create-order', async (req: Request, res: Response): Promise<void> => {
   try {
     const { invoiceId } = req.body;
 
@@ -445,14 +448,14 @@ app.post('/api/paypal/create-order', async (req: Request, res: Response): Promis
     }
 
     const trimmedInvoiceId = invoiceId.trim();
-    const invoice = invoicesStore.get(trimmedInvoiceId);
+    const invoice = await getInvoice(trimmedInvoiceId);
 
     if (!invoice) {
       console.warn(
-        `[Create Order Error] Missing invoice: Invoice with ID "${trimmedInvoiceId}" not found in backend repository. Available repository IDs: [${Array.from(invoicesStore.keys()).join(', ')}]`
+        `[Create Order Error] Missing invoice: Invoice with ID "${trimmedInvoiceId}" not found in Supabase.`
       );
       res.status(404).json({
-        error: `Invoice with ID ${trimmedInvoiceId} not found in backend repository. Ensure the invoice is registered via POST /api/invoices before creating a PayPal order.`,
+        error: `Invoice with ID ${trimmedInvoiceId} not found in backend repository. Ensure the invoice is registered before creating a PayPal order.`,
       });
       return;
     }
@@ -470,7 +473,7 @@ app.post('/api/paypal/create-order', async (req: Request, res: Response): Promis
       return;
     }
 
-    // Server-enforced order creation: amount and currency strictly derived from backend repository
+    // Server-enforced order creation: amount and currency strictly derived from Supabase repository
     const order = await createPayPalOrder({
       invoiceId: invoice.id,
       invoiceNumber: invoice.invoiceNumber,
@@ -479,11 +482,8 @@ app.post('/api/paypal/create-order', async (req: Request, res: Response): Promis
       customerName: invoice.customer,
     });
 
-    // Store association for verification
-    orderToInvoiceMap.set(order.id, {
-      invoiceId: invoice.id,
-      amount: invoice.amount,
-    });
+    // Store association in Supabase for verification
+    await savePayPalOrder(order.id, invoice.id, invoice.amount, 'USD');
 
     console.log(
       `[Create Order] PayPal Sandbox order ${order.id} created for Invoice ${invoice.id} (#${invoice.invoiceNumber}) - Verified Server Amount: $${invoice.amount.toFixed(2)} USD`
@@ -508,12 +508,12 @@ app.post('/api/paypal/create-order', async (req: Request, res: Response): Promis
 /**
  * POST /api/paypal/capture-order
  * Captures approved order and performs strict server-side verification:
- * 1. Verifies order belongs to target invoice
+ * 1. Verifies order belongs to target invoice via Supabase mapping
  * 2. Verifies capture status is COMPLETED
  * 3. Verifies capture amount matches invoice amount
- * 4. Idempotently marks invoice as paid and adds transaction to ledger
+ * 4. Atomically marks invoice as paid and adds transaction to ledger in Supabase
  */
-app.post('/api/paypal/capture-order', async (req: Request, res: Response): Promise<void> => {
+apiRouter.post('/paypal/capture-order', async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId, invoiceId } = req.body;
 
@@ -522,30 +522,32 @@ app.post('/api/paypal/capture-order', async (req: Request, res: Response): Promi
       return;
     }
 
-    // Verify invoice association
-    const mapped = orderToInvoiceMap.get(orderId);
-    const targetInvoiceId = invoiceId || mapped?.invoiceId;
+    const trimmedOrderId = orderId.trim();
+
+    // Verify invoice association from Supabase
+    const savedOrder = await getPayPalOrder(trimmedOrderId);
+    const targetInvoiceId = invoiceId || savedOrder?.invoiceId;
 
     if (!targetInvoiceId) {
       res.status(400).json({ error: 'Unable to verify invoice associated with this order' });
       return;
     }
 
-    const invoice = invoicesStore.get(targetInvoiceId);
+    const invoice = await getInvoice(targetInvoiceId);
     if (!invoice) {
-      res.status(404).json({ error: `Invoice ${targetInvoiceId} not found` });
+      res.status(404).json({ error: `Invoice ${targetInvoiceId} not found in Supabase repository` });
       return;
     }
 
     // Idempotency: If this order was already processed, return existing record
-    if (processedCaptures.has(orderId) && invoice.status === 'paid') {
-      let existingTx: TransactionRecord | undefined;
-      for (const tx of transactionsStore.values()) {
-        if (tx.reference === invoice.paypalCaptureId) {
-          existingTx = tx;
-          break;
-        }
-      }
+    if (
+      invoice.status === 'paid' &&
+      (invoice.paypalOrderId === trimmedOrderId || invoice.paypalCaptureId)
+    ) {
+      const existingTx = invoice.paypalCaptureId
+        ? await getTransactionByReference(invoice.paypalCaptureId)
+        : null;
+
       res.json({
         success: true,
         alreadyProcessed: true,
@@ -557,7 +559,7 @@ app.post('/api/paypal/capture-order', async (req: Request, res: Response): Promi
     }
 
     // Execute capture on PayPal Sandbox API
-    const captureResult = await capturePayPalOrder(orderId);
+    const captureResult = await capturePayPalOrder(trimmedOrderId);
 
     // Verify capture outcome
     if (captureResult.status !== 'COMPLETED') {
@@ -589,18 +591,18 @@ app.post('/api/paypal/capture-order', async (req: Request, res: Response): Promi
       }
     }
 
-    // Record capture in idempotency tracking
-    processedCaptures.add(orderId);
-
-    // Update state
-    const { invoice: updatedInvoice, transaction: createdTx } = settleInvoice(
-      invoice,
+    // Atomic update in Supabase
+    const { invoice: updatedInvoice, transaction: createdTx } = await settleInvoicePaymentAtomic({
+      invoiceId: invoice.id,
       captureId,
-      orderId
-    );
+      orderId: trimmedOrderId,
+      amount: invoice.amount,
+      customerName: invoice.customer,
+      invoiceNumber: invoice.invoiceNumber,
+    });
 
     console.log(
-      `[Capture Order] Successfully captured and verified PayPal Sandbox order ${orderId}, Invoice ${invoice.id} (#${invoice.invoiceNumber}), Capture ID: ${captureId}`
+      `[Capture Order] Successfully captured and verified PayPal Sandbox order ${trimmedOrderId}, Invoice ${invoice.id} (#${invoice.invoiceNumber}), Capture ID: ${captureId}`
     );
 
     res.json({
@@ -624,7 +626,7 @@ app.post('/api/paypal/capture-order', async (req: Request, res: Response): Promi
  * Handles asynchronous PayPal webhook notifications.
  * Cryptographically verifies signature and updates invoice status idempotently.
  */
-app.post('/api/paypal/webhook', async (req: Request, res: Response): Promise<void> => {
+apiRouter.post('/paypal/webhook', async (req: Request, res: Response): Promise<void> => {
   try {
     const headers = req.headers as WebhookHeaders;
     const event = req.body;
@@ -634,10 +636,13 @@ app.post('/api/paypal/webhook', async (req: Request, res: Response): Promise<voi
       return;
     }
 
-    // Prevent duplicate event replay
-    if (event.id && processedWebhookEventIds.has(event.id)) {
-      res.status(200).json({ status: 'Event already processed' });
-      return;
+    // Durable idempotency check in Supabase
+    if (event.id) {
+      const alreadyProcessed = await isWebhookProcessed(event.id);
+      if (alreadyProcessed) {
+        res.status(200).json({ status: 'Event already processed' });
+        return;
+      }
     }
 
     // Verify cryptographic signature with PayPal
@@ -649,7 +654,7 @@ app.post('/api/paypal/webhook', async (req: Request, res: Response): Promise<voi
     }
 
     if (event.id) {
-      processedWebhookEventIds.add(event.id);
+      await markWebhookProcessed(event.id, event.event_type);
     }
 
     const eventType: string = event.event_type;
@@ -659,10 +664,17 @@ app.post('/api/paypal/webhook', async (req: Request, res: Response): Promise<voi
       const captureId = resource.id;
       const invoiceId = resource.custom_id;
 
-      if (invoiceId && invoicesStore.has(invoiceId)) {
-        const invoice = invoicesStore.get(invoiceId)!;
-        if (invoice.status !== 'paid') {
-          settleInvoice(invoice, captureId);
+      if (invoiceId) {
+        const invoice = await getInvoice(invoiceId);
+        if (invoice && invoice.status !== 'paid') {
+          await settleInvoicePaymentAtomic({
+            invoiceId: invoice.id,
+            captureId,
+            orderId: resource.supplementary_data?.related_ids?.order_id || 'webhook',
+            amount: invoice.amount,
+            customerName: invoice.customer,
+            invoiceNumber: invoice.invoiceNumber,
+          });
           console.log(`[Webhook Success] Invoice ${invoice.invoiceNumber} marked as paid via webhook.`);
         }
       }
@@ -676,20 +688,21 @@ app.post('/api/paypal/webhook', async (req: Request, res: Response): Promise<voi
 });
 
 // Central error handler
-app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+apiRouter.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   console.error('[Server Error]', err);
   res.status(500).json({ error: 'Internal Server Error', message: err?.message });
 });
 
-if (
-  process.env.NODE_ENV !== 'test' &&
-  process.env.VERCEL !== '1'
-) {
+// Mount router on both /api (standard) and / (for Vercel rewrites where /api is stripped)
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
+
+if (process.env.NODE_ENV !== 'test' && process.env.VERCEL !== '1') {
   app.listen(PORT, () => {
     console.log(`[Biz Pulse AI Backend] Server running on http://localhost:${PORT}`);
     console.log(`[Biz Pulse AI Backend] PayPal Environment: ${process.env.PAYPAL_ENVIRONMENT || 'sandbox'}`);
   });
 }
+
 export { app };
 export default app;
-

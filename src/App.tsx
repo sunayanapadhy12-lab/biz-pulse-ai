@@ -83,24 +83,48 @@ export function App() {
   // Toast System State
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
-  // Safe initial synchronization of local invoices with backend repository
+  // Safe initial synchronization of local invoices with backend repository and load from Supabase
   useEffect(() => {
-    const syncInvoicesWithBackend = async () => {
+    const initAppData = async () => {
       try {
-        const response = await fetch('/api/invoices/sync', {
+        // 1. Synchronize initial demo invoices with backend safely (without overwriting paid ones)
+        const syncResponse = await fetch('/api/invoices/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ invoices: initialInvoices }),
         });
-        if (response.ok) {
-          const res = await response.json();
-          console.log('[Backend Invoice Sync]', res);
+        if (syncResponse.ok) {
+          const syncRes = await syncResponse.json();
+          console.log('[Backend Invoice Sync]', syncRes);
+        }
+
+        // 2. Fetch authoritative invoices from Supabase
+        const invoicesRes = await fetch('/api/invoices');
+        if (invoicesRes.ok) {
+          const fetchedInvoices: Invoice[] = await invoicesRes.json();
+          if (Array.isArray(fetchedInvoices) && fetchedInvoices.length > 0) {
+            setInvoices(fetchedInvoices);
+            // Filter payment reminders for invoices that are already paid
+            const paidInvoiceNumbers = new Set(
+              fetchedInvoices.filter((i) => i.status === 'paid').map((i) => i.invoiceNumber)
+            );
+            setReminders((prev) => prev.filter((r) => !paidInvoiceNumbers.has(r.invoiceNumber)));
+          }
+        }
+
+        // 3. Fetch authoritative transactions from Supabase
+        const txRes = await fetch('/api/transactions');
+        if (txRes.ok) {
+          const fetchedTx: Transaction[] = await txRes.json();
+          if (Array.isArray(fetchedTx) && fetchedTx.length > 0) {
+            setTransactions(fetchedTx);
+          }
         }
       } catch (err) {
-        console.warn('[Backend Invoice Sync Notice] Backend server not reachable yet:', err);
+        console.warn('[App Data Init Notice] Backend sync/fetch notice:', err);
       }
     };
-    syncInvoicesWithBackend();
+    initAppData();
   }, []);
 
   const showToast = (title: string, message?: string, type: ToastMessage['type'] = 'success') => {
@@ -188,13 +212,40 @@ export function App() {
     }
   };
 
-  // Add new Transaction
-  const handleSaveTransaction = (newTx: Transaction) => {
-    setTransactions([newTx, ...transactions]);
-    showToast(
-      'Transaction Recorded',
-      `${newTx.type === 'income' ? 'Received' : 'Paid'} $${newTx.amount.toLocaleString()} - ${newTx.name}`
-    );
+  // Add new Transaction and persist with backend repository
+  const handleSaveTransaction = async (newTx: Transaction): Promise<boolean> => {
+    try {
+      const response = await fetch('/api/transactions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newTx),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(data.message || data.error || 'Failed to save transaction');
+      }
+
+      const savedTx: Transaction = data.transaction || newTx;
+      setTransactions((prev) => [savedTx, ...prev]);
+
+      showToast(
+        'Transaction Recorded & Persisted',
+        `${savedTx.type === 'income' ? 'Received' : 'Paid'} $${savedTx.amount.toLocaleString()} - ${savedTx.name}`
+      );
+      return true;
+    } catch (err: any) {
+      console.error('[Transaction Save Error]', err);
+      // Keep in local state so user doesn't lose data
+      setTransactions((prev) => [newTx, ...prev]);
+      showToast(
+        'Transaction Recorded Locally',
+        `${newTx.type === 'income' ? 'Received' : 'Paid'} $${newTx.amount.toLocaleString()} (Saved locally: ${err.message})`,
+        'info'
+      );
+      return false;
+    }
   };
 
   // Send Reminder Action
@@ -207,12 +258,28 @@ export function App() {
     );
   };
 
-  // Mark invoice as paid
-  const handleMarkAsPaid = (invoiceId: string) => {
+  // Mark invoice as paid and sync status with backend
+  const handleMarkAsPaid = async (invoiceId: string) => {
+    const targetInvoice = invoices.find((inv) => inv.id === invoiceId);
+    if (!targetInvoice) return;
+
+    const updatedInvoice = { ...targetInvoice, status: 'paid' as const };
     setInvoices((prev) =>
-      prev.map((inv) => (inv.id === invoiceId ? { ...inv, status: 'paid' } : inv))
+      prev.map((inv) => (inv.id === invoiceId ? updatedInvoice : inv))
     );
-    showToast('Invoice Updated', 'Invoice has been marked as fully settled.');
+
+    // Sync updated status to backend
+    try {
+      await fetch('/api/invoices/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invoice: updatedInvoice }),
+      });
+    } catch (err) {
+      console.warn('[Mark As Paid Backend Sync Notice]', err);
+    }
+
+    showToast('Invoice Updated', `Invoice #${targetInvoice.invoiceNumber} has been marked as fully settled.`);
   };
 
   // Copy invoice link
